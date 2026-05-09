@@ -1,0 +1,169 @@
+name: 🎬 دریافت اطلاعات فیلم از IMDb (با دور زدن فیلتر)
+
+on:
+  workflow_dispatch:
+    inputs:
+      movie_name:
+        description: 'نام فیلم (مثال: The Godfather یا بازی تاج و تخت)'
+        required: true
+        type: string
+
+jobs:
+  fetch-imdb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- راه‌اندازی پروکسی WARP برای دور زدن فیلتر ----------
+      - name: راه‌اندازی کانتینر Cloudflare WARP
+        run: |
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            caomingjun/warp
+          echo "⏳ منتظر آماده‌سازی WARP (15 ثانیه)..."
+          sleep 15
+          # تست اتصال (اختیاری)
+          curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://ifconfig.me || echo "⚠️ WARP شاید کامل آماده نباشد، اما ادامه می‌دهیم."
+
+      - name: نصب Python و کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: کش pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-imdb-${{ hashFiles('**/requirements.txt') }}
+      - name: نصب پیش‌نیازها
+        run: pip install requests beautifulsoup4
+
+      - name: استخراج اطلاعات IMDb از طریق پروکسی WARP
+        env:
+          MOVIE: ${{ github.event.inputs.movie_name }}
+          PROXY_URL: "socks5://127.0.0.1:1080"
+        run: |
+          python3 - <<'EOF'
+          import requests, re, json, os, sys, urllib.parse
+          from bs4 import BeautifulSoup
+          from datetime import datetime
+
+          MOVIE_NAME = os.environ['MOVIE']
+          PROXY = os.environ.get('PROXY_URL')
+          proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+
+          print(f"🔍 جستجوی فیلم: {MOVIE_NAME} با پروکسی WARP")
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9"
+          }
+
+          try:
+              # 1. جستجو در IMDb
+              search_url = f"https://www.imdb.com/find?q={urllib.parse.quote(MOVIE_NAME)}&s=tt&ttype=ft"
+              resp = requests.get(search_url, headers=headers, proxies=proxies, timeout=30)
+              resp.raise_for_status()
+              soup = BeautifulSoup(resp.text, 'html.parser')
+              first_result = soup.select_one('.findResult .result_text a')
+              if not first_result:
+                  print("❌ هیچ فیلمی با این نام یافت نشد.")
+                  sys.exit(1)
+              movie_url = "https://www.imdb.com" + first_result['href']
+              print(f"✅ صفحه فیلم: {movie_url}")
+
+              # 2. دریافت صفحه اصلی فیلم
+              page = requests.get(movie_url, headers=headers, proxies=proxies, timeout=30)
+              page.raise_for_status()
+              soup = BeautifulSoup(page.text, 'html.parser')
+
+              # 3. استخراج اطلاعات (توابع ایمن)
+              def get_text(selector, attr=None):
+                  tag = soup.select_one(selector)
+                  if tag:
+                      return tag.get(attr) if attr else tag.get_text(strip=True)
+                  return "نامشخص"
+
+              title = get_text('h1[data-testid="hero-title-block__title"]')
+              year = get_text('a[href*="releaseinfo"]') or get_text('span[data-testid="title-year"]')
+              rating = get_text('div[data-testid="hero-rating-bar__aggregate-rating"] span:first-child')
+              genres = [g.get_text(strip=True) for g in soup.select('div[data-testid="genres"] a')]
+              director = get_text('a[href*="fullcredits"]', 'aria-label') or get_text('li[data-testid="title-pc-principal-credit"] a')
+              cast = [a.get_text(strip=True) for a in soup.select('div[data-testid="title-cast-item"] a')][:5]
+              plot = get_text('span[data-testid="plot-xs_to_m"]')
+              runtime = get_text('li[data-testid="title-techspec_runtime"] div')
+              poster_tag = soup.select_one('div[data-testid="hero-media__poster"] img')
+              poster = poster_tag['src'] if poster_tag else "ندارد"
+              imdb_id = movie_url.split('/')[4]
+
+              # 4. ساخت خروجی
+              output_dir = "imdb_movies"
+              os.makedirs(output_dir, exist_ok=True)
+              safe_name = re.sub(r'[\\/*?:"<>|]', "", title)
+              now = datetime.now().strftime("%Y%m%d_%H%M%S")
+              filename = f"{output_dir}/{safe_name}_{now}.md"
+
+              with open(filename, "w", encoding="utf-8") as f:
+                  f.write(f"""# 🎞️ {title} ({year})
+
+## 📊 اطلاعات اصلی فیلم
+
+| ویژگی | مقدار |
+|--------|-------|
+| **نام فیلم** | {title} |
+| **سال ساخت** | {year} |
+| **امتیاز IMDb** | ⭐ {rating} |
+| **مدت زمان** | {runtime} |
+| **ژانر(ها)** | {', '.join(genres)} |
+| **کارگردان** | {director} |
+| **بازیگران اصلی** | {', '.join(cast[:3])} |
+| **خلاصه داستان** | {plot} |
+| **لینک IMDb** | [مشاهده در IMDb](https://www.imdb.com/title/{imdb_id}/) |
+| **پوستر فیلم** | ![پوستر]({poster}) |
+
+## 📝 توضیحات تکمیلی
+
+- **تعداد بازیگران استخراج شده:** {len(cast)} نفر
+- **شناسه IMDb:** `{imdb_id}`
+- **تاریخ ذخیره‌سازی:** {now}
+- **منبع:** IMDb رسمی (از طریق پروکسی WARP)
+
+> 🎯 این اطلاعات به صورت خودکار توسط GitHub Actions از سایت IMDb گرفته شده است.
+""")
+              print(f"✅ فایل اطلاعات فیلم ذخیره شد: {filename}")
+
+              # ذخیره JSON برای استفاده بعدی
+              with open(os.path.join(output_dir, "latest.json"), "w", encoding="utf-8") as jf:
+                  json.dump({
+                      "title": title, "year": year, "rating": rating, "genres": genres,
+                      "director": director, "cast": cast, "plot": plot, "runtime": runtime,
+                      "imdb_id": imdb_id, "poster": poster, "file": filename
+                  }, jf, indent=2, ensure_ascii=False)
+
+          except Exception as e:
+              print(f"❌ خطا در دریافت اطلاعات: {e}")
+              sys.exit(1)
+          EOF
+
+      - name: توقف کانتینر WARP
+        if: always()
+        run: docker stop warp || true && docker rm warp || true
+
+      - name: Commit و Push به مخزن
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add imdb_movies/
+          if ! git diff --cached --quiet; then
+            git commit -m "🎬 افزودن اطلاعات فیلم (IMDb via WARP) [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ اطلاعات با موفقیت به مخزن اضافه شد."
+          else
+            echo "ℹ️ هیچ تغییر جدیدی وجود ندارد."
+          fi
